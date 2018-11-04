@@ -1,4 +1,6 @@
-# frozen_string_literal: true
+q# frozen_string_literal: true
+
+require 'pp'
 
 #========================================================================
 # Entities
@@ -6,7 +8,7 @@
 #
 # A Card is what it sounds like it is.
 #
-# A Session is the entire game, played with a single deck and with the
+# A Session is the entire game, played with a single shoe and with the
 # same set of players and dealer.
 #
 # A Player is a person who plays the Games in a Session. The Dealer is
@@ -31,8 +33,10 @@ require 'logger'
 LOG = Logger.new(STDOUT)
 LOG.level = Logger::DEBUG
 
+DECKS_IN_SHOE = 500
+
 def log(*args)
-  LOG.debug(*args)
+#  LOG.debug(*args)
 end
 
 # Am I doing this right? I feel unclean.
@@ -61,7 +65,7 @@ module Blackjack
   class Card
     VALUES = %w(A 2 3 4 5 6 7 8 9 10 J Q K).freeze
     FACES = %w(J Q K).freeze
-    SUITS = %w(C S A D).freeze
+    SUITS = %w(C S H D).freeze
 
     attr_reader :value, :suit
 
@@ -117,6 +121,10 @@ module Blackjack
       "<Hand #{@cards.to_s}>"
     end
 
+    def inspect
+      "<Hand #{@cards.to_s}>"
+    end
+
     def take_card(card)
       @cards << card
     end
@@ -124,6 +132,11 @@ module Blackjack
     # The possible values of the hand
     def values
       Blackjack::combine(@cards.map(&:point_values)).map(&:sum)
+    end
+
+    # Max non-busted value
+    def max_value
+      values.select { |v| v <= 21 }.max
     end
 
     # Kinda weird: we ask the hand how it wants to be played, but
@@ -134,7 +147,7 @@ module Blackjack
     end
 
     def blackjack?
-      @cards.size == 2 && values.max == 21
+      @cards.size == 2 && max_value == 21
     end
 
     def busted?
@@ -180,7 +193,6 @@ module Blackjack
       @name = name
       @strategy = BasicStrategy.new(session)
       new_hand
-      log "pi: ch:#{@cardhand}"
     end
 
     def new_hand
@@ -197,15 +209,14 @@ module Blackjack
     def decide(hand)
       @strategy.decide(hand)
     end
-
   end
 
 
   class Session
-    attr_reader :dealer, :rubes, :deck
+    attr_reader :dealer, :rubes, :shoe
 
     def initialize(rube_qty: 1)
-      @deck = Card.deck
+      @shoe = DECKS_IN_SHOE.times.flat_map { Card.deck }
       @dealer = Player.new(self, "Dealer")
       @rubes = rube_qty.times.map do |ix|
         Player.new(self, "Rube #{ix}")
@@ -213,12 +224,28 @@ module Blackjack
     end
 
     def deal_card(hand)
-      log "deal_card: h:#{hand}"
-      hand.take_card(@deck.pop)
+      next_card = @shoe.pop
+      raise BlackjackError.new("Game over") if next_card.nil?
+      hand.take_card(next_card)
     end
 
     def game
       Game.new(self)
+    end
+
+    # Play until the shoe is exhausted
+    def play_until_end
+      begin
+        results = []
+        loop do
+          result = game.play
+          results << result.values
+        end
+      rescue BlackjackError
+        puts "game over"
+      end
+      agg = results.group_by {|v| v}.map { |k, v| "#{k}: #{v.size}" }
+      puts agg
     end
   end
 
@@ -236,28 +263,59 @@ module Blackjack
     end
 
     def deal
-      log('deal')
-      2.times do |_|
-        @session.deal_card(@session.dealer.hand)
-      end
+      @session.dealer.new_hand
+      @session.rubes.each { |rube| rube.new_hand }
+
+      2.times { @session.deal_card(@session.dealer.hand) }
+
       rube_hands.each do |hand|
-        2.times do |_|
-          @session.deal_card(hand)
-        end
+        2.times { @session.deal_card(hand) }
       end
     end
 
+    # Return the winners
     def play
-      log("psj: Blackjack.deck::Game.play play: play")
       deal
-      return wins(@session.dealer) if @session.dealer.hand.blackjack?
-      rube_hands.each do |hand|
-        run_rube_hand(hand)
+      result = {}
+      if @session.dealer.hand.blackjack?
+        log "dealer backjack: wins!"
+        rube_hands.each { |h| result[h] = :lose }
+        return result
       end
+
+      rube_hands.each do |hand|
+        run_hand(hand)
+      end
+
+      log "running dealer hand: #{@session.dealer.hand}"
+      if run_hand(@session.dealer.hand) == :busted
+        log "dealer busted, non-busted rubes win"
+        dealer_value = 0
+      else
+        dealer_value = @session.dealer.hand.max_value
+      end
+
+      log "dealer value: #{dealer_value}"
+      result = {}
+      rube_hands.each do |hand|
+        rube_value = hand.max_value
+        log " rube hand: #{hand} -> #{rube_value}"
+        if !rube_value
+          rube_result = :lose
+        elsif rube_value == dealer_value
+          rube_result = :push
+        elsif rube_value > dealer_value
+          rube_result = :win
+        else
+          rube_result = :lose
+        end
+        log "  result: #{rube_result}"
+        result[hand] = rube_result
+      end
+      result
     end
 
-    def run_rube_hand(hand)
-      puts "run_rube_hand: #{hand}"
+    def run_hand(hand)
       loop do
         decision = hand.decide
         case decision
@@ -265,7 +323,10 @@ module Blackjack
           return :stand
         when :hit
           @session.deal_card(hand)
-          return :busted if hand.busted?
+          if hand.busted?
+            log "busted: #{hand}"
+            return :busted
+          end
         else
           raise BlackjackError.new("Unknown decision: #{decision}")
         end
